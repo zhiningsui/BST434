@@ -1,0 +1,598 @@
+---
+title: "sva package tutorial"
+output:
+  html_document:
+    number_sections: true
+    df_print: paged
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+# # Install sva package
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# 
+# BiocManager::install("sva")
+
+# # Install limma
+# BiocManager::install("limma")
+```
+
+# Overview
+The package includes the popular ComBat function for directly modeling batch effects when they are known. 
+
+There are also potentially a large number of environmental and biological variables that are unmeasured and may have a large impact on measurements from high-throughput biological experiments. For these cases the `sva()` function may be more appropriate for removing these artifacts. 
+
+It is also possible to use the `sva()` function with the `ComBat()` function to remove both known batch effects and other potential latent sources of variation.
+
+# Setting up the expression data from the pSVA paper
+The first step in using the `sva` package is to properly format the data and create appropriate model matrices. The data should be a matrix with features (genes, transcripts, voxels) in the rows and samples in the columns.
+
+The `sva` package assumes there are two types of variables that are being considered: (1) adjustment variables and (2) primary variables of interest. We will be trying to analyze the association between the variables of interest and gene expression, adjusting for the adjustment variables.
+
+Two model matrices must be made: the "full model" and the "null model". The null model is a model matrix that includes terms for all of the adjustment variables but not the variables of interest. The full model includes terms for both the adjustment variables and the variables of interest. 
+
+We will use the HNSCC dataset from the pSVA paper. The normalized expression data of the 80 samples are stored in `edata` and the variables are stored in `info`.
+```{r}
+# load pre-processed normalized expression matrix
+load("data/frma.chung.RData")
+edata <- frma.chung
+rm(frma.chung)
+
+# load the variables of samples
+load("data/info.chung.RData")
+info <- info.chung
+rm(info.chung)
+```
+
+The data contains the expression of 54,675 genes of 80 samples. The samples were collected with different procurement and processed with different RNA amplification kits, which have been used to define 3 batches, stored as `info$processing`. The variable of interest is HPV status. We create a new `info$batch` column to save the processing batches as factors, and also save HPV status as factors in `info$HPV.Stat`.
+
+```{r}
+dim(edata)
+edata[1:5, 1:5]
+
+head(info)
+str(info)
+
+info$HPV.Stat <- factor(info$HPV.Stat)
+info$batch <- factor(info$processing)
+```
+
+We create the full model matrix - including both the adjustment variables and the variable of interest (HPV status). Assume no adjustment variables. 
+
+```{r}
+# full model
+mod <- model.matrix(~HPV.Stat, data = info)
+```
+
+The null model contains only the adjustment variables. Since we are not adjusting for any other variables in this analysis, only an intercept is included in the model.
+
+```{r}
+# null model
+mod0 <- model.matrix(~1, data = info)
+```
+
+# Performing batch correction
+## Applying the `sva()` function to estimate batch and other artifacts
+First we identify the number of surrogate variables that need to be estimated using the `num.sv()` function. There are two approaches to estimate the number of surrogate variables. The default approach is based on the permutation procedure originally proposed by Buja and Eyuboglu 1992. The `num.sv()` function also provides an interface to the asymptotic approach proposed by Leek 2011 Biometrics. 
+
+```{r}
+library(sva)
+
+# default permutation algorithm
+n.sv.be = num.sv(edata, mod, method="be", B=50)
+n.sv.be
+
+# asymtotic approach
+n.sv.leek = num.sv(edata, mod, method="leek")
+n.sv.leek
+
+```
+
+Then we apply the `sva()` function to estimate the surrogate variables:
+```{r}
+svobj <- sva(dat = edata, mod = mod, mod0 = mod0, n.sv = n.sv.be)
+dim(svobj$sv)
+svobj$n.sv
+```
+
+Alternatively, if the `sva()` function is called without the `n.sv` argument specified, the number of factors will be automatically estimated for us, so we do not need to call `num.sv()` separately. 
+```{r}
+# run SVA
+svobj = sva(dat = edata, mod = mod, mod0 = mod0)
+
+# assign column names to the surrogate variables
+colnames(svobj$sv) = paste0("sv", c(1:ncol(svobj$sv))) 
+svobj$sv[1:5,]
+```
+
+After we estimate the surrogate variables, we can get the expression matrix batch-corrected by SVA by adjusting for the surrogate variables. The first step is to include the surrogate variables in the full model such that we treat them as independent variables in the model.
+
+```{r}
+# adjusting for surrogate variables by adding the surrogate variables to the design matrices
+modSv = cbind(mod, svobj$sv)
+```
+
+We then fit the linear regression model 
+$$\boldsymbol{X}=\boldsymbol{\beta}\boldsymbol{Y}+\boldsymbol{\alpha}\boldsymbol{Z}+\boldsymbol{\gamma}\boldsymbol{h}+\boldsymbol{\epsilon}$$
+using the primary variables ($\boldsymbol{Y}$), the adjustment variables ($\boldsymbol{Z}$), and the surrogate variables ($\boldsymbol{h}$) as the covariates, and using the expression matrix ($\boldsymbol{X}$) as the response variable.
+
+We estimate the coefficients of the surrogate variables ($\hat{\boldsymbol{\gamma}}$) and adjustment variables ($\hat{\boldsymbol{\alpha}}$). We then calculate the batch-corrected expression matrix as $$\boldsymbol{X}^*=\boldsymbol{X}-\hat{\boldsymbol{\alpha}}\boldsymbol{Z}-\hat{\boldsymbol{\gamma}}\boldsymbol{h}.$$ 
+Here, we have $\boldsymbol{Z}=\boldsymbol{0}$.
+
+In other words, we are fitting a linear model on each row (gene) of the expression matrix to find the gene-specific coefficients and storing those in `sva.coeffs`. There are three ways to find the coefficients:
+
+1. The `lm()` function is primarily designed for models with a single response variable. If we want to use `lm()`, we can use `lapply()` function to fit the model on each row in a more compact and readable way, reducing the need for loops. 
+
+```{r}
+
+## Using lm from base R
+
+# fit a separate linear model for each row (gene) in edata. sva.fit.list is the list of `lm` models.
+sva.fit.list <- lapply(1:nrow(edata), function(i) lm(edata[i,] ~ modSv[,-1]))
+
+# extract coefficients from each model. sva.coeffs.list now contains a list of the coefficients from each model
+sva.coeffs.list <- lapply(sva.fit.list, coef)
+
+# convert the list of coefficients to a data frame for better readability
+sva.coeffs <- do.call(rbind, sva.coeffs.list)
+
+# assign corresponding variable names to the coefficients
+colnames(sva.coeffs) <- colnames(modSv)
+
+sva.coeffs[1:5,]
+```
+
+2. Use the `lmFit()` function in the `limma` package. It is designed to fit linear model for each gene given a series of samples. 
+
+```{r}
+## Use lmFit from limma
+
+library(limma)
+sva.fit <- lmFit(edata, modSv)
+sva.coeffs <- sva.fit$coefficients
+sva.coeffs[1:5,]
+```
+
+3. Calculate the coefficients in the matrix form. The coefficient estimates for the linear model of one gene is 
+$$\hat{\boldsymbol{\beta}}=(\boldsymbol{Y}^T\boldsymbol{Y})^{-1}\boldsymbol{Y}^TX,$$
+where $X$ is a vector (the expression of one gene) in this formula. We want to calculate the estimates for all the genes (all rows in the matrix $\boldsymbol{X}$), so we need to take the transpose of $\boldsymbol{X}$ so that the expression data of each gene is in one column. The estimated coefficients matrix obtained has the coefficients of each gene in each column, so we again take the transpose to make the coefficients matrix have genes in the rows. 
+
+```{r}
+## Matrix calculation 
+
+sva.coeffs <- solve(t(modSv) %*% modSv) %*% t(modSv) %*% t(edata) 
+sva.coeffs <- t(sva.coeffs) 
+sva.coeffs[1:5,]
+```
+
+Now we have the coefficient estimates for all variables, we then extract the coefficients for surrogate variables and calculate the corrected expression matrix. If there exist adjustment variables, we should also extract the coefficient estimates for those variables and subtract $\hat{\boldsymbol{\alpha}}\boldsymbol{Z}$ from the original expression matrix. 
+
+```{r}
+# extract the coefficient estimates for surrogate variables. 
+gamma.hat <- sva.coeffs[, colnames(svobj$sv)] 
+
+# subtract the effect of surrogate variables from edata
+sva.edata <- edata -  gamma.hat %*% t(modSv[, colnames(svobj$sv)])
+dim(sva.edata)
+sva.edata[1:5, 1:5]
+```
+
+
+## Applying the `ComBat()` function to adjust for known batches
+The `ComBat()` function adjusts for known batches using an empirical Bayesian framework. In order to use the function, we must have a known batch variable in our dataset. We use HPV status as the primary variable, and the sample processing as the batch. 
+
+```{r}
+batch = info$batch
+```
+
+We then need to create a model matrix for the adjustment variables, including the variable of interest. Note that we do not include batch in creating this model matrix - it will be included later in the `ComBat()` function.
+
+```{r}
+modcombat = model.matrix(~HPV.Stat, data=info)
+```
+
+We now apply the `ComBat()` function to the data, using the default parametric empirical Bayesian adjustments. It returns a batch corrected expression matrix, with the same dimensions as the original dataset. This new expression matrix has been adjusted for batch.
+
+```{r}
+# parametric adjustment
+combat.edata = ComBat(dat = edata, 
+                      batch = batch, 
+                      mod = modcombat, 
+                      par.prior = TRUE, 
+                      prior.plots = FALSE)
+
+dim(combat.edata)
+combat.edata[1:5, 1:5]
+```
+
+```{r}
+# # non-parametric adjustment, mean-only version
+# combat.edata.2 = ComBat(dat = edata,  
+#                              batch = batch,
+#                              mod = NULL,
+#                              par.prior = FALSE,
+#                              mean.only = TRUE)
+```
+
+
+## Applying the `sva()` function after the `ComBat()` function that adjusted for known batches
+We run the `sva()` function on the ComBat corrected expression matrix `combat.edata` to identify and estimate the surrogate variable after excluding the signals from the known batches. 
+
+Here, I just used the matrix calculation to find the coefficient estimates. 
+```{r}
+# run SVA on the ComBat corrected expression matrix
+svobj.combat <- sva(dat = combat.edata, mod = mod, mod0 = mod0)
+# assign names to the surrogate variables
+colnames(svobj.combat$sv) = paste0("sv", c(1:ncol(svobj.combat$sv))) 
+
+# update the design matrix to account for the surrogate variables. 
+modSv = cbind(mod, svobj.combat$sv)
+mod0Sv = cbind(mod0, svobj.combat$sv)
+colnames(modSv)
+colnames(mod0Sv)
+
+# matrix calculation to obtain the coefficient estimates
+sva.combat.coeffs <- solve(t(modSv) %*% modSv) %*% t(modSv) %*% t(combat.edata)
+sva.combat.coeffs <- t(sva.combat.coeffs)
+sva.combat.coeffs[1:5,]
+
+# calculate the batch corrected expression matrix 
+gamma.hat <- sva.combat.coeffs[, colnames(svobj.combat$sv)] # coeff estimates for SVs
+sva.combat.edata <- combat.edata -  gamma.hat %*% t(modSv[, colnames(svobj.combat$sv)])
+sva.combat.edata[1:5, 1:5]
+```
+
+
+## Applying the `psva()` function to adjust for known batches
+The `psva()` function adjusts for known batches. In order to use the function, we must have a known factor variable giving the known batch levels. The function returns an expression matrix with batch effect removed but biological heterogeneity preserved.
+
+```{r}
+batch <-  info$batch
+
+# run psva
+psva.edata <- psva(dat = edata, batch = batch)
+# assign sample names to the columns
+colnames(psva.edata) <- colnames(edata)
+
+dim(psva.edata)
+psva.edata[1:5, 1:5]
+```
+
+## Removing known batch effects with a linear model
+Direct adjustment for batch effects can also be performed by fitting the model that includes batches as the adjustment variable.
+
+```{r}
+mod.batch = model.matrix(~HPV.Stat + batch, data = info)
+```
+We obtain the expression matrix with the effect from known batches being removed directly.
+
+```{r}
+# matrix calculation to obtain the coefficient estimates
+direct.coeffs <- solve(t(mod.batch) %*% mod.batch) %*% t(mod.batch) %*% t(edata)
+direct.coeffs <- t(direct.coeffs)
+direct.coeffs[1:5,]
+
+# extract the coefficient estimates for the batch variables
+batch.var <- colnames(direct.coeffs)[startsWith(colnames(direct.coeffs), "batch")]
+alpha.hat <- direct.coeffs[, batch.var] # coeff estimates for known batch
+
+# subtract effect from known batch
+direct.edata <- edata - alpha.hat %*% t(mod.batch[, batch.var])
+direct.edata[1:5, 1:5]
+```
+
+
+## Applying SVA with known batches
+In the pSVA paper, the authors also run SVA to estimate surrogate variables from the model with batch as the primary variable, which is `mod0.batch`. 
+
+```{r}
+mod0.batch = model.matrix(~batch, data = info)
+
+# run sva to get estimates of surrogate variables
+svobj.batch <- sva(dat = edata, mod = mod0.batch, mod0 = mod0)
+colnames(svobj.batch$sv) = paste0("sv", c(1:ncol(svobj.batch$sv))) 
+svobj.batch$sv[1:5,]
+```
+
+The surrogate variables for the biological heterogeneity are estimated and can be included in the linear model as independent predictors. Again, we obtain the coefficient estimates for the known batches, and the surrogate variables.
+
+```{r}
+# update the design matrix to account for the surrogate variables. 
+modSv = cbind(mod0.batch, svobj.batch$sv)
+colnames(modSv)
+
+# matrix calculation to obtain the coefficient estimates
+sva.batch.coeffs <- solve(t(modSv) %*% modSv) %*% t(modSv) %*% t(edata)
+sva.batch.coeffs <- t(sva.batch.coeffs)
+sva.batch.coeffs[1:5,]
+```
+
+Now we want to calculate the expression matrix removing the effect of batches. However, unlike the previous situation where we subtract the effect of surrogate variables from the original expression matrix, here we need to subtract the effect of the known batch effects and retain the net effect of the surrogate variables (since they are surrogate variables for biological heterogeneity). 
+
+```{r}
+# calculate the batch corrected matrix
+# extract the coefficient estimates for the batch variables
+alpha.hat <- sva.batch.coeffs[, batch.var] # coeff estimates for known batch
+sva.batch.edata <- edata - alpha.hat %*% t(modSv[, batch.var])
+sva.batch.edata[1:5, 1:5]
+```
+
+## Applying SVA with known primary variables and batches
+The authors also run SVA with HPV status as the primary variable and the known batch as the adjustment variable, which is the same as `mod.batch`. Now, the surrogate variables have the same net effect as the unmodeled biological heterogeneity and unmodeled artifacts.  
+
+```{r}
+# run sva to get estimates of surrogate variables
+colnames(mod.batch)
+svobj.batch.hpv <- sva(dat = edata, mod = mod.batch, mod0 = mod0)
+
+colnames(svobj.batch.hpv$sv) = paste0("sv", c(1:ncol(svobj.batch.hpv$sv))) 
+svobj.batch.hpv$sv[1:5,]
+
+# calculate the batch corrected matrix
+# update the design matrix to account for the surrogate variables. 
+modSv = cbind(mod.batch, svobj.batch.hpv$sv)
+colnames(modSv)
+
+# matrix calculation to obtain the coefficient estimates
+sva.batch.hpv.coeffs <- solve(t(modSv) %*% modSv) %*% t(modSv) %*% t(edata)
+sva.batch.hpv.coeffs <- t(sva.batch.hpv.coeffs)
+sva.batch.hpv.coeffs[1:5,]
+
+```
+
+Since it is possible that the surrogate variables contain signals from unknown biological factors, to calculate the batch-corrected expression matrix, we only remove the effects from the known batches, and retain the effects of the surrogate variables in the matrix. 
+
+```{r}
+# calculate the batch corrected expression matrix 
+gamma.hat <- sva.batch.hpv.coeffs[, colnames(svobj.batch.hpv$sv)] # coeff estimates for SVs
+alpha.hat <- sva.batch.hpv.coeffs[, batch.var] # coeff estimates for known batch
+
+# sva.batch.hpv.edata <- edata - gamma.hat %*% t(svobj.batch.hpv$sv) - alpha.hat %*% t(modSv[, batch.var])
+sva.batch.hpv.edata <- edata - alpha.hat %*% t(modSv[, batch.var])
+sva.batch.hpv.edata[1:5, 1:5]
+```
+
+# Summary of batch-corrected expression matrices
+
+From the original expression matrix `edata`, we obtained the batch-corrected matrices:
+
+`sva.edata`: obtained by estimating the SVs from the model `edata ~ HPV.Stat`, and then removing the effect of SVs from the model `edata ~ HPV.Stat + SVs`;
+
+`combat.edata`: obtained by parametric empirical Bayesian adjustments of known batches from the model `edata ~ HPV.Stat`;
+
+`sva.combat.edata`: obtained by estimating the SVs from the model `combat.edata ~ HPV.Stat`, and then removing the effect of SVs from the model `combat.edata ~ HPV.Stat + SVs`;
+
+`psva.edata`: obtained by estimating the SVs from the model `edata ~ processing`, and then removing the effect of known batches from the model `edata ~ processing + SVs`;
+
+`direct.edata`: obtained by directly removing the effect of known batches in the model `edata ~ HPV.Stat + processing`, without applying SVA or ComBat. 
+
+`sva.batch.edata`: obtained by estimating the SVs from the model `edata ~ batch`, and then removing the effect of known batches from the model `edata ~ batch + SVs`;
+
+`sva.batch.hpv.edata`: obtained by estimating the SVs from the model `edata ~ HPV.Stat + batch`, and then removing the effect of known batches from the model `edata ~ HPV.Stat + batch + SVs`;
+
+
+# Performing hierarchical clustering based on the expression matrices
+
+```{r}
+library(ClassDiscovery)
+# perform hierarchical clustering using pearson correlation and complete agglomeration method
+hc.edata <- hclust(distanceMatrix(edata, 'pearson'), method='complete')
+plotColoredClusters(hc.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='None')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+
+```{r}
+hc.combat.edata <- hclust(distanceMatrix(combat.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.combat.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='ComBat')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+```{r}
+hc.sva.edata <- hclust(distanceMatrix(sva.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.sva.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='SVA')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+```{r}
+hc.sva.combat.edata <- hclust(distanceMatrix(sva.combat.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.sva.combat.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='SVA+ComBat')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+
+```{r}
+hc.psva.edata <- hclust(distanceMatrix(psva.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.psva.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='pSVA')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+
+```{r}
+hc.direct.edata <- hclust(distanceMatrix(direct.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.direct.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='Direct Adjustment')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+
+```{r}
+hc.sva.batch.edata <- hclust(distanceMatrix(sva.batch.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.sva.batch.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='SVA with model ~ batch')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+
+```{r}
+hc.sva.batch.hpv.edata <- hclust(distanceMatrix(sva.batch.hpv.edata, 'pearson'), method='complete')
+plotColoredClusters(hc.sva.batch.hpv.edata,
+                    labs=info[colnames(edata),'Research.num'],
+                    cols=as.character(factor(info[colnames(edata),'processing'],
+                                             levels=c('Frozen Nugen Ovation',
+                                                      'FFPE Nugen_FFPE', 
+                                                      'Frozen Nugen_FFPE'),
+                                             labels=c('blue','red','green'))),
+                    xlab='',main='SVA with model ~ HPV.Stat + batch')
+
+legend('topright', fill=c('blue','red','green'), legend=c('Frozen, Nugen Ovation', 'FFPE, Nugen_FFPE', 'Frozen, Nugen_FFPE'))
+```
+
+# Calculating correlations between pSVA-corrected expression matrix with non-corrected and other corrected expression matrices
+
+```{r}
+# correlation between batch corrected data from different techniques with pSVA
+corS <- matrix(NA, nrow=7, ncol=ncol(psva.edata),
+               dimnames=list(c('None','ComBat','SVA','ComBat+SVA','SVA.batch','SVA.batch.hpv', 'Direct'),
+                             colnames(psva.edata)))
+
+for (s in colnames(psva.edata)) {
+  corS['None',s] <- cor(psva.edata[,s], edata[,s])
+  corS['ComBat',s] <- cor(psva.edata[,s], combat.edata[,s])
+  corS['SVA',s] <- cor(psva.edata[,s], sva.edata[,s])
+  corS['ComBat+SVA',s] <- cor(psva.edata[,s], sva.combat.edata[,s])
+  corS['SVA.batch',s] <- cor(psva.edata[,s], sva.batch.edata[,s])
+  corS['SVA.batch.hpv',s] <- cor(psva.edata[,s], sva.batch.hpv.edata[,s])
+  corS['Direct',s] <- cor(psva.edata[,s], direct.edata[,s])
+}
+
+boxplot(t(corS),las=2,ylab='Correlation coefficient')
+```
+
+# Applying `f.pvalue()` function for differential expression analysis
+The `f.pvalue()` function can be used to calculate parametric F-test p-values for each row of a data matrix (i.e., each feature). The F-test compares the full model `mod` and the null model `mod0`. They must be nested models, so all of the variables in `mod0` must appear in `mod`. 
+
+In the case of the HNSCC study, this would correspond to calculating a parametric F-test p-value for each of the 54,675 genes of the matrix. Note that the typical differential expression analysis is performed if we have known biological covariate and we want to test if each gene is differentially expressed in different biological groups. So, we will not perform the significance analysis on the pSVA-corrected expression data, and the data corrected by SVA with only batch in the model.
+
+First we can calculate the F-test p-values for differential expression with respect to HPV status, without adjusting for surrogate variables and known batches, adjust them for multiple testing, and calculate the number that are significant with a Q-value less than 0.05.
+
+```{r}
+# No adjustment
+colnames(mod)
+colnames(mod0)
+pValues = f.pvalue(dat = edata, mod = mod, mod0 = mod0)
+qValues = p.adjust(pValues,method="BH")
+
+# proportion of genes strongly differentially expressed at an FDR of less than 0.05 between groups.
+mean(qValues < 0.05)
+```
+
+For the direct adjustment of batches without batch correction algorithm, we set the null model to be `~ batch` and the full model to be `~ HPV.Stat + batch`.
+
+```{r}
+# Batch adjustment
+colnames(mod.batch) # ~ HPV + batch
+colnames(mod0.batch) # ~ batch
+
+pValues = f.pvalue(dat = edata, mod = mod.batch, mod0 = mod0.batch)
+qValues = p.adjust(pValues,method="BH")
+
+mean(qValues < 0.05)
+```
+
+For SVA, we can perform the same analysis, but adjusting for surrogate variables. We need to include the surrogate variables in both the null and full models and perform the significance analysis on the original expression matrix.
+
+```{r}
+# adjusting for surrogate variables by adding the surrogate variables to the design matrices
+modSv = cbind(mod, svobj$sv)
+mod0Sv = cbind(mod0, svobj$sv)
+colnames(modSv)
+colnames(mod0Sv)
+
+pValuesSv = f.pvalue(edata, modSv, mod0Sv)
+qValuesSv = p.adjust(pValuesSv, method="BH")
+mean(qValuesSv < 0.05) 
+
+```
+
+For the SVA with both HPV and batch in the model, the significance analysis is:
+```{r}
+modSvBatch = cbind(mod.batch, svobj.batch.hpv$sv)
+mod0SvBatch = cbind(mod0.batch, svobj.batch.hpv$sv)
+colnames(modSvBatch)
+colnames(mod0SvBatch)
+
+pValuesSvBatch = f.pvalue(edata, modSvBatch, mod0SvBatch)
+qValuesSvBatch = p.adjust(pValuesSvBatch,method="BH")
+mean(pValuesSvBatch < 0.05)
+```
+
+For the ComBat algorithm, significance analysis can then be performed directly on the ComBat-corrected expression matrix using the original full and null models.
+
+```{r}
+pValuesComBat = f.pvalue(combat.edata, mod, mod0)
+qValuesComBat = p.adjust(pValuesComBat, method="BH")
+
+mean(qValuesComBat < 0.05)
+```
+
+For the SVA+ComBat algorithm, we include the surrogate variables in the full and null models and perform the significance analysis on the ComBat-corrected expression matrix.
+
+```{r}
+modSvCombat = cbind(mod, svobj.combat$sv)
+mod0SvCombat = cbind(mod0, svobj.combat$sv)
+colnames(modSvCombat)
+colnames(mod0SvCombat)
+
+pValuesSvComBat = f.pvalue(combat.edata, modSvCombat, mod0SvCombat)
+qValuesSvComBat = p.adjust(pValuesSvComBat,method="BH")
+mean(qValuesSvComBat < 0.05)
+```
+
+# Surrogate variables versus direct adjustment
+The goal of the `sva` is to remove all unwanted sources of variation while protecting the contrasts due to the primary variables included in `mod`. This leads to the identification of features that are consistently different between groups, removing all common sources of latent variation.
+
+In some cases, the latent variables may be important sources of biological variability. If the goal of the analysis is to identify heterogeneity in one or more subgroups, the `sva()` function may not be appropriate. For example, suppose that it is expected that cancer samples represent two distinct, but unknown subgroups. If these subgroups have a large impact on expression, then one or more of the estimated surrogate variables may be very highly correlated with subgroup.
+
+In contrast, direct adjustment only removes the effect of known batch variables. All sources of latent biological variation will remain in the data using this approach. In other words, if the samples were obtained in different environments, this effect will remain in the data. If important sources of heterogeneity (from different environments, lab effects, etc.) are not accounted for, this may lead to increased false positives.
+
