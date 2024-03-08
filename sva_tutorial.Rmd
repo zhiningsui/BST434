@@ -7,9 +7,7 @@ output:
 ---
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
-```
 
-```{r}
 
 # if (!require("BiocManager", quietly = TRUE))
 #     install.packages("BiocManager")
@@ -19,6 +17,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # install.packages('ClassDiscovery')
 ```
+
 
 # Overview
 The package includes the popular ComBat function for directly modeling batch effects when they are known. 
